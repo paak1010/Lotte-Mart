@@ -127,8 +127,8 @@ if uploaded_file is not None:
             df_grouped = df_grouped.rename(columns={'ME코드': '상품코드'})
             
             final_columns = [
-                '수주일자', '납품일자, '발주코드', '배송코드', '센터', 
-                '수주일자', '납품일자', '상품코드', '품명', 
+                '수주일자', '납품일자, '발주코드', '배송코드', 
+                '센터', '상품코드', '품명', 
                 'UNIT수량', 'UNIT단가', 'Total Amount', '   '
             ]
             
