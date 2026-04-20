@@ -2,113 +2,75 @@ import streamlit as st
 import pandas as pd
 import duckdb
 import io
-import re
 
-st.set_page_config(page_title="롯데마트 수주 자동화 V2", layout="wide")
+st.set_page_config(page_title="롯데마트 수주 자동화", layout="wide")
 
-st.title("📦 롯데마트 수주서 변환기 (최종 양식 맞춤)")
-st.write("EDI RAW 데이터를 업로드하면 '롯데마트 수주' 시트 양식으로 즉시 변환합니다.")
+st.title("📦 롯데마트 수주 데이터 자동 생성기")
+st.write("첫 번째 시트(RAW)의 데이터를 바탕으로 '수주' 양식을 자동 생성합니다.")
 
-# 1. 매핑 데이터 로드 (GitHub에 올린 mapping.csv 활용)
-@st.cache_data
-def load_mapping():
-    try:
-        df = pd.read_csv('mapping.csv')
-        # 바코드를 문자열로 통일
-        df['바코드'] = df['바코드'].astype(str)
-        return df
-    except:
-        st.warning("⚠️ 'mapping.csv' 파일을 찾을 수 없습니다. 상품코드 매핑 없이 진행합니다.")
-        return pd.DataFrame(columns=['바코드', 'ME코드'])
-
-mapping_df = load_mapping()
-
-# 2. 파일 업로드
-uploaded_file = st.file_uploader("EDI 발주서 (라떼는.xlsx 등) 업로드", type=['xlsx', 'csv'])
+# 파일 업로드
+uploaded_file = st.file_uploader("롯데마트 서식 파일을 업로드해주세요.", type=['xlsx'])
 
 if uploaded_file is not None:
-    with st.spinner("데이터 매핑 및 변환 중..."):
+    with st.spinner("데이터를 분석하고 수주 시트를 생성 중입니다..."):
         try:
-            # 데이터 로드
-            if uploaded_file.name.endswith('.csv'):
-                df_all = pd.read_csv(uploaded_file, header=None)
-            else:
-                df_all = pd.read_excel(uploaded_file, header=None)
-
-            # --- EDI 데이터 파싱 로직 ---
-            final_rows = []
-            current_center = ""
-            current_doc_no = ""
+            # 1. 첫 번째 시트(RAW) 읽기 (헤더는 0번 행 기준)
+            df_raw = pd.read_excel(uploaded_file, sheet_name=0)
             
-            for i, row in df_all.iterrows():
-                row_list = row.tolist()
-                
-                # 'ORDERS'로 시작하는 행에서 센터명과 문서번호 추출
-                if str(row_list[0]) == 'ORDERS':
-                    current_doc_no = str(row_list[1])
-                    current_center = str(row_list[5]) # 점포(센터)
-                    continue
-                
-                # 실제 상품 행 추출 (판매코드가 880으로 시작)
-                val_code = str(row_list[1])
-                if val_code.startswith('880'):
-                    # 주문수에서 숫자만 추출 (예: '1 (BOX)' -> 1)
-                    order_qty_raw = str(row_list[6])
-                    order_qty_val = int(re.sub(r'[^0-9]', '', order_qty_raw))
-                    
-                    # 입수량 추출 및 총 수량 계산 (UNIT수량)
-                    case_size = int(row_list[5]) if pd.notnull(row_list[5]) else 1
-                    total_units = order_qty_val * case_size
-                    
-                    if total_units > 0:
-                        final_rows.append({
-                            '발주코드': current_doc_no, # 또는 센터코드 매핑 필요 시 수정
-                            '배송코드': current_doc_no,
-                            '센터': current_center,
-                            '바코드': val_code,
-                            '품명': row_list[2],
-                            'UNIT수량': total_units,
-                            'UNIT단가': row_list[7],
-                            'Total Amount': row_list[8]
-                        })
-
-            df_extracted = pd.DataFrame(final_rows)
-
-            # 3. DuckDB를 활용한 ME 코드 매핑 및 최종 양식 구성
+            # 데이터 컬럼 인덱스 확인 및 매핑
+            # 사용자 피드백 반영: 상품코드는 가장 끝쪽(인덱스 13)에 있는 것을 사용
+            # 시트 구조에 따른 컬럼 추출:
+            # [0]점포코드, [1]점포(센터), [4]상품명, [9]단가, [10]주문금액, [12]납품수량, [13]상품코드(ME), [18]배송코드
+            
+            # 2. DuckDB를 사용하여 수량이 0보다 큰 데이터만 추출하고 양식에 맞게 변환
+            # 컬럼명이 중복될 경우를 대비해 인덱스 기반으로 쿼리를 구성하거나 컬럼명을 정제합니다.
+            df_raw.columns = [f"col_{i}" for i in range(len(df_raw.columns))]
+            
             query = """
                 SELECT 
-                    '' as " ", 
-                    a.발주코드, 
-                    '' as "  ", 
-                    a.배송코드, 
-                    a.센터, 
-                    COALESCE(m.ME코드, a.바코드) as 상품코드, 
-                    a.품명, 
-                    a.UNIT수량, 
-                    a.UNIT단가, 
-                    a."Total Amount",
+                    '' as " ",
+                    col_0 as "발주코드",
+                    '' as "  ",
+                    col_18 as "배송코드",
+                    col_1 as "센터",
+                    col_13 as "상품코드",
+                    col_4 as "품명",
+                    CAST(col_12 AS INTEGER) as "UNIT수량",
+                    col_9 as "UNIT단가",
+                    col_10 as "Total Amount",
                     '' as "   "
-                FROM df_extracted a
-                LEFT JOIN mapping_df m ON a.바코드 = m.바코드
+                FROM df_raw
+                WHERE col_12 IS NOT NULL 
+                  AND CAST(col_12 AS INTEGER) > 0
             """
             
             result_df = duckdb.query(query).df()
-
-            st.success(f"처리 완료! {len(result_df)}개의 품목이 생성되었습니다.")
-            st.subheader("📋 수주 시트 미리보기")
+            
+            # 3. 결과 출력 및 다운로드
+            st.success(f"변환 완료! 유효 수주 {len(result_df)}건을 찾았습니다.")
+            
+            st.subheader("📋 생성된 수주 시트 미리보기")
             st.dataframe(result_df, use_container_width=True)
-
-            # 4. 엑셀 다운로드 (양식 유지)
+            
+            # 엑셀 파일 생성 (두 번째 시트 이름은 '롯데마트 수주')
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                 result_df.to_excel(writer, index=False, sheet_name='롯데마트 수주')
+                
+                # 엑셀 서식 간단 조정 (선택 사항)
+                workbook = writer.book
+                worksheet = writer.sheets['롯데마트 수주']
+                header_format = workbook.add_format({'bold': True, 'bg_color': '#D7E4BC', 'border': 1})
+                for col_num, value in enumerate(result_df.columns.values):
+                    worksheet.write(0, col_num, value, header_format)
             
             st.download_button(
-                label="📥 롯데마트 수주 양식 다운로드",
+                label="📥 변환된 수주 엑셀 다운로드",
                 data=buffer.getvalue(),
-                file_name=f"롯데마트_수주_{current_doc_no}.xlsx",
+                file_name="롯데마트_수주_자동생성.xlsx",
                 mime="application/vnd.ms-excel"
             )
-
+            
         except Exception as e:
-            st.error(f"오류 발생: {e}")
+            st.error(f"오류가 발생했습니다: {e}")
+            st.info("첫 번째 시트의 컬럼 순서가 [0:점포코드, 12:납품수량, 13:상품코드]인지 확인해주세요.")
