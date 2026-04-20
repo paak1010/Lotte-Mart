@@ -6,155 +6,137 @@ import re
 
 st.set_page_config(page_title="롯데마트 수주 자동화", layout="wide")
 
-st.title("📦 롯데마트 수주 자동 변환기 (초고속 안정화 버전)")
-st.write("EDI Raw Data를 업로드하면 0건을 제외한 수주 내역을 추출합니다.")
+st.title("📦 롯데마트 수주 자동 변환기")
+st.write("EDI Raw Data만 업로드하세요. 센터별 고정 코드와 ME코드를 매핑하여 최종 양식을 생성합니다.")
 
+# 💡 깃허브의 고정 서식 파일
 TEMPLATE_FILE = '2022 롯데마트 서식파일 260417납품.xlsx'
 
-if not os.path.exists(TEMPLATE_FILE):
-    st.error(f"⚠️ '{TEMPLATE_FILE}' 파일을 찾을 수 없습니다. 깃허브에 파일이 있는지 확인해주세요.")
-    st.stop()
+# 센터별 고정 코드 설정
+CENTER_CODE_MAP = {
+    '오산상온센타': '81030907',
+    '김해상온센타': '81030908'
+}
 
 @st.cache_data
 def load_template_sheets():
-    df_raw_template = pd.read_excel(TEMPLATE_FILE, sheet_name=0)
-    df_order = pd.read_excel(TEMPLATE_FILE, sheet_name=1)
-    return df_raw_template, df_order
+    # 1번 시트: 바코드-ME코드 매핑용, 2번 시트: 출력 양식용
+    df_map = pd.read_excel(TEMPLATE_FILE, sheet_name=0)
+    df_out = pd.read_excel(TEMPLATE_FILE, sheet_name=1)
+    return df_map, df_out
 
 uploaded_file = st.file_uploader("📥 EDI Raw Data 업로드", type=['xlsx', 'csv'])
 
 if uploaded_file is not None:
-    with st.spinner("충돌 없이 데이터를 완벽하게 병합 중입니다... 🚀"):
+    with st.spinner("센터별 코드를 매핑하고 수주서를 생성 중입니다..."):
         try:
-            # 1. 템플릿 로드
-            df_raw_template, df_order = load_template_sheets()
+            df_map_sheet, df_out_sheet = load_template_sheets()
 
-            # 2. 업로드된 EDI 데이터 파싱
+            # 1. EDI Raw 데이터 파싱 (고속 처리)
             if uploaded_file.name.endswith('.csv'):
                 df_edi = pd.read_csv(uploaded_file, header=None)
             else:
                 df_edi = pd.read_excel(uploaded_file, header=None)
             
             df_edi = df_edi.dropna(how='all')
-
-            # 3. 데이터 일괄 파싱 (초고속 벡터화)
-            col_0 = df_edi[0].astype(str).str.strip()
-            col_1 = df_edi[1].astype(str).str.replace('.0', '', regex=False).str.strip()
             
-            is_orders = col_0 == 'ORDERS'
-            df_edi['발주코드'] = None
-            df_edi['센터'] = None
+            parsed_list = []
+            curr_center = ""
             
-            df_edi.loc[is_orders, '발주코드'] = col_1[is_orders]
-            df_edi.loc[is_orders, '센터'] = df_edi[5].astype(str).str.strip()[is_orders]
+            for i, row in df_edi.iterrows():
+                r = [str(x).strip() for x in row.tolist()]
+                # 센터명 추출
+                if r[0] == 'ORDERS':
+                    curr_center = r[5]
+                    continue
+                
+                # 상품 행 (880 바코드)
+                barcode = r[1].replace('.0', '')
+                if barcode.startswith('880'):
+                    # 주문수 숫자만 추출 (BOX 제거)
+                    qty_str = re.sub(r'[^0-9]', '', r[6])
+                    qty = int(qty_str) if qty_str else 0
+                    
+                    # 입수량 곱하기
+                    ipsu_str = r[5].replace(',', '')
+                    ipsu = int(float(ipsu_str)) if ipsu_str.replace('.', '').isdigit() else 1
+                    
+                    unit_qty = qty * ipsu
+                    
+                    if unit_qty > 0:
+                        parsed_list.append({
+                            '센터': curr_center,
+                            '바코드': barcode,
+                            'UNIT수량': unit_qty
+                        })
             
-            df_edi['발주코드'] = df_edi['발주코드'].ffill()
-            df_edi['센터'] = df_edi['센터'].ffill()
-            
-            is_item = col_1.str.startswith('880')
-            df_items = df_edi[is_item].copy()
-            
-            if df_items.empty:
-                st.warning("⚠️ 유효한 발주 상품(880 바코드)을 찾을 수 없습니다.")
+            if not parsed_list:
+                st.warning("⚠️ 유효한 발주 수량이 없습니다.")
                 st.stop()
 
-            # 4. 수량 계산
-            df_items['판매코드'] = col_1[is_item]
-            
-            df_items['입수_str'] = df_items[5].astype(str).str.replace(',', '', regex=False)
-            df_items['입수'] = pd.to_numeric(df_items['입수_str'], errors='coerce').fillna(1).astype(int)
-            
-            df_items['주문수_str'] = df_items[6].astype(str).str.replace(r'[^0-9]', '', regex=True)
-            df_items['주문수'] = pd.to_numeric(df_items['주문수_str'], errors='coerce').fillna(0).astype(int)
-            
-            df_items['UNIT수량'] = df_items['입수'] * df_items['주문수']
-            df_parsed = df_items[df_items['UNIT수량'] > 0][['발주코드', '센터', '판매코드', 'UNIT수량']]
+            df_parsed = pd.DataFrame(parsed_list)
 
-            # 5. ME코드 매핑
-            panmae_cols = [c for c in df_raw_template.columns if '판매코드' in str(c)]
-            sangpum_cols = [c for c in df_raw_template.columns if '상품코드' in str(c)]
-            panmae_col = panmae_cols[0] if panmae_cols else df_raw_template.columns[3]
-            me_col = sangpum_cols[-1] if sangpum_cols else df_raw_template.columns[-1]
+            # 2. ME코드 매핑 (1번 시트 활용)
+            # 바코드 열(index 3)과 ME코드 열(index 13) 추출
+            mapping_dict = df_map_sheet.iloc[:, [3, 13]].dropna()
+            mapping_dict.columns = ['바코드', 'ME코드']
+            mapping_dict['바코드'] = mapping_dict['바코드'].astype(str).str.replace('.0', '', regex=False).str.strip()
             
-            df_mapping = df_raw_template[[panmae_col, me_col]].dropna()
-            df_mapping.columns = ['판매코드', 'ME코드']
-            df_mapping['판매코드'] = df_mapping['판매코드'].astype(str).str.replace('.0', '', regex=False).str.strip()
-            df_mapping['ME코드'] = df_mapping['ME코드'].astype(str).str.strip()
-            df_mapping = df_mapping.drop_duplicates()
+            df_final_data = pd.merge(df_parsed, mapping_dict, on='바코드', how='left')
+            df_final_data['ME코드'] = df_final_data['ME코드'].fillna(df_final_data['바코드'])
 
-            df_mapped = pd.merge(df_parsed, df_mapping, on='판매코드', how='left')
-            df_mapped['ME코드'] = df_mapped['ME코드'].fillna(df_mapped['판매코드'])
-            df_agg = df_mapped.groupby(['센터', 'ME코드', '발주코드'], as_index=False)['UNIT수량'].sum()
+            # 3. 2번 시트 양식에 데이터 입히기
+            # 템플릿의 모든 품목 리스트를 가져와서 업로드한 데이터와 합침
+            df_out_sheet['센터_key'] = df_out_sheet['센터'].astype(str).str.strip()
+            df_out_sheet['상품코드_key'] = df_out_sheet['상품코드'].astype(str).str.strip()
+            df_final_data['센터_key'] = df_final_data['센터'].astype(str).str.strip()
+            df_final_data['ME코드_key'] = df_final_data['ME코드'].astype(str).str.strip()
 
-            # 6. 두 번째 시트(수주 양식)에 데이터 합치기 (충돌 완벽 방지 🛡️)
-            orig_cols = list(df_order.columns) # 원래 엑셀 양식 기억하기
-            
-            # 유연한 컬럼 찾기 (양식이 조금 바뀌어도 알아서 찾아냄)
-            def find_col(df, keywords):
-                for kw in keywords:
-                    for c in df.columns:
-                        if kw in str(c): return c
-                return None
-            
-            c_center = find_col(df_order, ['센터', '점포'])
-            c_item = find_col(df_order, ['상품코드', 'ME코드'])
-            c_qty = find_col(df_order, ['수량', 'UNIT'])
-            c_price = find_col(df_order, ['단가', 'Price'])
-            c_total = find_col(df_order, ['Total Amount', '금액'])
-            c_order_no = find_col(df_order, ['발주코드', '주문번호'])
-            c_deliv_no = find_col(df_order, ['배송코드'])
-
-            df_order['센터_str'] = df_order[c_center].astype(str).str.strip()
-            df_order['상품코드_str'] = df_order[c_item].astype(str).str.strip()
-            
-            # 병합 전 충돌을 막기 위해 추출한 데이터의 컬럼 이름을 안전하게 변경!
-            df_agg_merge = df_agg.copy()
-            df_agg_merge['센터_str'] = df_agg_merge['센터'].astype(str).str.strip()
-            df_agg_merge['ME코드_str'] = df_agg_merge['ME코드'].astype(str).str.strip()
-            
-            # 핵심! 기존 양식의 '센터'와 이름이 겹치지 않도록 골라내서 가져옴
-            df_agg_safe = df_agg_merge[['센터_str', 'ME코드_str', 'UNIT수량', '발주코드']].rename(
-                columns={'UNIT수량': 'EDI_수량', '발주코드': 'EDI_발주'}
+            # 데이터 병합
+            merged = pd.merge(
+                df_out_sheet, 
+                df_final_data[['센터_key', 'ME코드_key', 'UNIT수량']], 
+                left_on=['센터_key', '상품코드_key'], 
+                right_on=['센터_key', 'ME코드_key'], 
+                how='inner'
             )
+
+            # 4. 고정 코드 적용 (오산 81030907, 김해 81030908)
+            merged['발주코드'] = merged['센터_key'].map(CENTER_CODE_MAP)
+            merged['배송코드'] = merged['발주코드']
+            merged['UNIT수량'] = merged['UNIT수량_y']
             
-            final_df = pd.merge(df_order, df_agg_safe, left_on=['센터_str', '상품코드_str'], right_on=['센터_str', 'ME코드_str'], how='inner')
+            # 금액 계산
+            merged['단가_num'] = pd.to_numeric(merged['UNIT단가'].astype(str).str.replace(',', ''), errors='coerce').fillna(0)
+            merged['Total Amount'] = merged['UNIT수량'] * merged['단가_num']
+
+            # 5. 최종 양식 정리 (컬럼 순서 유지 및 빈 열 복원)
+            orig_cols = [c for c in df_out_sheet.columns if '_key' not in str(c)]
+            result_df = merged[orig_cols].copy()
             
-            # 발주코드, 배송코드, 수량, 금액 덮어쓰기
-            if c_order_no: final_df[c_order_no] = final_df['EDI_발주']
-            if c_deliv_no: final_df[c_deliv_no] = final_df['EDI_발주']
-            if c_qty: final_df[c_qty] = final_df['EDI_수량']
-            
-            def clean_price(x):
-                try: return float(str(x).replace(',', ''))
-                except: return 0.0
-            
-            if c_qty and c_price and c_total:
-                final_df['UNIT단가_clean'] = final_df[c_price].apply(clean_price)
-                final_df[c_total] = final_df[c_qty] * final_df['UNIT단가_clean']
-            
-            # 7. 원래 양식으로 복원 (이제 에러 날 일이 없습니다)
-            out_df = final_df[orig_cols].copy()
-            clean_cols = []
-            space_cnt = 1
-            for c in out_df.columns:
+            # 시각적 피드백을 위해 Unnamed 컬럼을 공백으로 변환
+            new_cols = []
+            space_idx = 1
+            for c in result_df.columns:
                 if 'Unnamed' in str(c):
-                    clean_cols.append(" " * space_cnt)
-                    space_cnt += 1
+                    new_cols.append(" " * space_idx)
+                    space_idx += 1
                 else:
-                    clean_cols.append(c)
-            out_df.columns = clean_cols
+                    new_cols.append(c)
+            result_df.columns = new_cols
 
-            st.success(f"✨ 변환 완료! 유효 수주 {len(out_df)}건이 성공적으로 추출되었습니다.")
-            st.dataframe(out_df, use_container_width=True)
+            st.success(f"✨ 변환 성공! {len(result_df)}건의 유효 수주를 추출했습니다.")
+            st.dataframe(result_df, use_container_width=True)
 
+            # 다운로드
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                out_df.to_excel(writer, index=False, sheet_name='롯데마트 수주')
+                result_df.to_excel(writer, index=False, sheet_name='롯데마트 수주')
             
             st.download_button(
                 label="📥 최종 수주 파일 다운로드",
                 data=buffer.getvalue(),
-                file_name="롯데마트_수주_완료.xlsx",
+                file_name="롯데마트_수주_최종_결과.xlsx",
                 mime="application/vnd.ms-excel"
             )
 
