@@ -2,100 +2,115 @@ import streamlit as st
 import pandas as pd
 import duckdb
 import io
-import os
+import re
 
-st.set_page_config(page_title="롯데마트 수주 자동화 (Raw Data 전용)", layout="wide")
+st.set_page_config(page_title="롯데마트 수주 자동화 V2", layout="wide")
 
-st.title("📦 롯데마트 수주서 자동 생성기")
-st.write("오늘 다운받은 **Raw Data**만 업로드하세요. 서버에 저장된 템플릿 양식에 맞춰 자동으로 매핑 후 0건을 제외하고 출력합니다.")
+st.title("📦 롯데마트 수주서 변환기 (최종 양식 맞춤)")
+st.write("EDI RAW 데이터를 업로드하면 '롯데마트 수주' 시트 양식으로 즉시 변환합니다.")
 
-# 💡 깃허브에 이미 올려두신 서식 파일 이름
-TEMPLATE_FILE = '2022 롯데마트 서식파일 260417납품.xlsx'
+# 1. 매핑 데이터 로드 (GitHub에 올린 mapping.csv 활용)
+@st.cache_data
+def load_mapping():
+    try:
+        df = pd.read_csv('mapping.csv')
+        # 바코드가 엑셀에서 실수로 읽혀 '.0'이 붙는 현상 방지 및 앞뒤 공백 제거
+        df['바코드'] = df['바코드'].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+        return df
+    except:
+        st.warning("⚠️ 'mapping.csv' 파일을 찾을 수 없습니다. 상품코드 매핑 없이 진행합니다.")
+        return pd.DataFrame(columns=['바코드', 'ME코드'])
 
-if not os.path.exists(TEMPLATE_FILE):
-    st.error(f"⚠️ 깃허브에서 '{TEMPLATE_FILE}' 파일을 찾을 수 없습니다. 파일명이 정확한지 확인해주세요.")
-    st.stop()
+mapping_df = load_mapping()
 
-# 1. 사용자는 오직 Raw Data 하나만 업로드
-uploaded_file = st.file_uploader("📥 오늘 작업할 Raw Data 파일을 업로드해주세요.", type=['xlsx', 'csv'])
+# 2. 파일 업로드
+uploaded_file = st.file_uploader("EDI 발주서 (라떼는.xlsx 등) 업로드", type=['xlsx', 'csv'])
 
 if uploaded_file is not None:
-    with st.spinner("서식 파일과 Raw Data를 매칭하여 0건을 걸러내는 중입니다..."):
+    with st.spinner("데이터 매핑 및 변환 중..."):
         try:
-            # 2. 업로드한 Raw Data 읽기
+            # 데이터 로드
             if uploaded_file.name.endswith('.csv'):
-                df_raw = pd.read_csv(uploaded_file)
+                df_all = pd.read_csv(uploaded_file, header=None)
             else:
-                df_raw = pd.read_excel(uploaded_file, sheet_name=0)
-            
-            # 컬럼 이름을 인덱스 번호로 변환 (col_1: 센터, col_12: 수량, col_13: ME코드)
-            df_raw.columns = [f"col_{i}" for i in range(len(df_raw.columns))]
-            
-            # 3. 깃허브에 있는 서식 파일의 '두 번째 시트' 읽기 (템플릿 기준점)
-            df_template = pd.read_excel(TEMPLATE_FILE, sheet_name=1)
-            
-            # 엑셀의 빈 컬럼(열) 양식 그대로 살리기
-            clean_cols = []
-            space_count = 1
-            for col in df_template.columns:
-                if "Unnamed" in str(col):
-                    clean_cols.append(" " * space_count)
-                    space_count += 1
-                else:
-                    clean_cols.append(str(col).strip())
-            df_template.columns = clean_cols
+                df_all = pd.read_excel(uploaded_file, header=None)
 
-            # 4. DuckDB를 활용해 두 번째 시트 기준 + Raw Data 매핑 + 0 이상 필터링
+            # --- EDI 데이터 파싱 로직 ---
+            final_rows = []
+            current_center = ""
+            current_doc_no = ""
+            
+            for i, row in df_all.iterrows():
+                row_list = row.tolist()
+                
+                # 'ORDERS'로 시작하는 행에서 센터명과 문서번호 추출
+                if str(row_list[0]) == 'ORDERS':
+                    current_doc_no = str(row_list[1]).replace('.0', '').strip()
+                    current_center = str(row_list[5]).strip() # 점포(센터)
+                    continue
+                
+                # 실제 상품 행 추출 (판매코드가 880으로 시작)
+                # 여기도 실수형 변환 방지를 위해 '.0' 제거
+                val_code = str(row_list[1]).replace('.0', '').strip()
+                
+                if val_code.startswith('880'):
+                    # 주문수에서 숫자만 추출 (예: '1 (BOX)' -> 1)
+                    order_qty_raw = str(row_list[6])
+                    order_qty_val = int(re.sub(r'[^0-9]', '', order_qty_raw))
+                    
+                    # 입수량 추출 및 총 수량 계산 (UNIT수량)
+                    case_size = int(row_list[5]) if pd.notnull(row_list[5]) else 1
+                    total_units = order_qty_val * case_size
+                    
+                    if total_units > 0:
+                        final_rows.append({
+                            '발주코드': current_doc_no, 
+                            '배송코드': current_doc_no,
+                            '센터': current_center,
+                            '바코드': val_code,
+                            '품명': str(row_list[2]).strip(),
+                            'UNIT수량': total_units,
+                            'UNIT단가': row_list[7],
+                            'Total Amount': row_list[8]
+                        })
+
+            df_extracted = pd.DataFrame(final_rows)
+
+            # 3. DuckDB를 활용한 ME 코드 매핑 및 최종 양식 구성
             query = """
-                WITH RawAgg AS (
-                    -- Raw Data에서 센터별, ME코드별 납품수량 합계 추출
-                    SELECT 
-                        col_1 AS center_name,
-                        col_13 AS me_code,
-                        MAX(col_0) AS order_code,     -- 발주코드 갱신용
-                        MAX(col_18) AS delivery_code, -- 배송코드 갱신용
-                        SUM(CAST(col_12 AS INTEGER)) AS total_qty
-                    FROM df_raw
-                    WHERE col_12 IS NOT NULL AND CAST(col_12 AS INTEGER) > 0
-                    GROUP BY col_1, col_13
-                )
-                -- 두 번째 시트(t)를 바탕으로 매핑된 수량(r) 업데이트 및 0건 제외
                 SELECT 
-                    t." ",
-                    COALESCE(r.order_code, t."발주코드") AS "발주코드",
-                    t."  ",
-                    COALESCE(r.delivery_code, t."배송코드") AS "배송코드",
-                    t."센터",
-                    t."상품코드",
-                    t."품명",
-                    COALESCE(r.total_qty, 0) AS "UNIT수량",
-                    t."UNIT단가",
-                    t."Total Amount",
-                    t."   "
-                FROM df_template t
-                LEFT JOIN RawAgg r 
-                       ON t."센터" = r.center_name 
-                      AND t."상품코드" = r.me_code
-                WHERE COALESCE(r.total_qty, 0) > 0
+                    '' as " ", 
+                    a.발주코드, 
+                    '' as "  ", 
+                    a.배송코드, 
+                    a.센터, 
+                    COALESCE(m.ME코드, a.바코드) as 상품코드, 
+                    a.품명, 
+                    a.UNIT수량, 
+                    a.UNIT단가, 
+                    a."Total Amount",
+                    '' as "   "
+                FROM df_extracted a
+                LEFT JOIN mapping_df m ON a.바코드 = m.바코드
             """
             
             result_df = duckdb.query(query).df()
 
-            st.success(f"처리 완료! 수주 내역 {len(result_df)}건이 성공적으로 추출되었습니다.")
+            st.success(f"처리 완료! {len(result_df)}개의 품목이 생성되었습니다.")
+            st.subheader("📋 수주 시트 미리보기")
             st.dataframe(result_df, use_container_width=True)
 
-            # 5. 최종 제출용 엑셀 다운로드 (양식 완벽 유지)
+            # 4. 엑셀 다운로드 (양식 유지)
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                 result_df.to_excel(writer, index=False, sheet_name='롯데마트 수주')
             
             st.download_button(
-                label="📥 최종 롯데마트 수주 엑셀 다운로드",
+                label="📥 롯데마트 수주 양식 다운로드",
                 data=buffer.getvalue(),
-                file_name="롯데마트_수주_완료건.xlsx",
+                file_name=f"롯데마트_수주_{current_doc_no}.xlsx",
                 mime="application/vnd.ms-excel"
             )
 
         except Exception as e:
-            st.error(f"오류가 발생했습니다: {e}")
-            st.info("올려주신 Raw Data 파일이 기존 양식과 맞는지 확인해주세요.")
+            st.error(f"오류 발생: {e}")
