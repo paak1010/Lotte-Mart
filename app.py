@@ -1,326 +1,154 @@
 import streamlit as st
 import pandas as pd
-import openpyxl
-from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-import re
 import io
-from copy import copy
+import os
+import re
 
-st.set_page_config(page_title="롯데마트 발주 자동화", page_icon="📦", layout="wide")
+st.set_page_config(page_title="롯데마트 수주 자동화", layout="wide")
 
-st.title("📦 롯데마트 발주 자동화")
-st.markdown("서식파일과 주문파일을 업로드하면 자동으로 RAW 데이터와 수주 요약을 생성합니다.")
+st.title("📦 롯데마트 수주 자동 변환기")
+st.write("EDI Raw Data(라떼는.xlsx)를 업로드하면 0건을 제외한 수주 내역을 추출합니다.")
 
-col1, col2 = st.columns(2)
-with col1:
-    template_file = st.file_uploader("📋 서식파일 업로드 (.xlsx)", type=["xlsx"], key="template")
-with col2:
-    order_file = st.file_uploader("📄 주문파일 업로드 (.xlsx)", type=["xlsx"], key="order")
+# 💡 깃허브에 있는 고정 서식 파일 (템플릿)
+TEMPLATE_FILE = '2022 롯데마트 서식파일 260417납품.xlsx'
 
-def parse_order_file(order_bytes):
-    """주문파일에서 센터별 데이터 파싱"""
-    df_raw = pd.read_excel(io.BytesIO(order_bytes), header=None)
-    
-    centers = []
-    current_center = None
-    items = []
-    
-    # 문서번호, 발주코드 매핑 저장
-    doc_info = {}
-    
-    i = 0
-    while i < len(df_raw):
-        row = df_raw.iloc[i].tolist()
-        row_str = [str(v) if pd.notna(v) else '' for v in row]
-        
-        # 헤더행 감지 (문서명, 문서번호 등)
-        if '문서명' in row_str and '점포(센터)' in row_str:
-            i += 1
-            data_row = df_raw.iloc[i].tolist()
-            data_str = [str(v) if pd.notna(v) else '' for v in data_row]
-            
-            # 센터명과 발주코드 추출
-            센터명 = ''
-            발주코드 = ''
-            문서번호 = ''
-            
-            try:
-                center_idx = row_str.index('점포(센터)')
-                센터명 = data_str[center_idx]
-            except (ValueError, IndexError):
-                pass
-            
-            try:
-                doc_idx = row_str.index('문서번호')
-                문서번호 = data_str[doc_idx]
-            except (ValueError, IndexError):
-                pass
-            
-            if current_center and items:
-                centers.append({'센터': current_center, '발주코드': doc_info.get(current_center, ''), '문서번호': doc_info.get(current_center + '_doc', ''), 'items': items})
-                items = []
-            
-            current_center = 센터명
-            doc_info[센터명] = 발주코드
-            doc_info[센터명 + '_doc'] = 문서번호
-            i += 1
-            continue
-        
-        # 상품코드 헤더행 스킵
-        if '상품코드' in row_str and '판매코드' in row_str and '주문수' in row_str:
-            i += 1
-            continue
-        
-        # 합계행 스킵
-        if '합계' in row_str:
-            i += 1
-            continue
-        
-        # 실제 데이터행 감지 (상품코드가 숫자 형태)
-        first_val = str(row[0]) if pd.notna(row[0]) else ''
-        if first_val and first_val.replace('.0', '').isdigit() and len(first_val.replace('.0', '')) >= 10:
-            # 주문수에서 (BOX) 제거
-            주문수_raw = str(row[6]) if pd.notna(row[6]) else '0'
-            주문수 = re.sub(r'\s*\(BOX\)', '', 주문수_raw).strip()
-            try:
-                주문수_int = int(float(주문수))
-            except:
-                주문수_int = 0
-            
-            item = {
-                '상품코드': str(row[0]).replace('.0', '') if pd.notna(row[0]) else '',
-                '판매코드': str(row[1]).replace('.0', '') if pd.notna(row[1]) else '',
-                '상품명': str(row[2]) if pd.notna(row[2]) else '',
-                '점포명': str(row[3]) if pd.notna(row[3]) else '',
-                '규격': str(row[4]) if pd.notna(row[4]) else '',
-                '입수': str(row[5]).replace('.0', '') if pd.notna(row[5]) else '',
-                '주문수': 주문수_int,
-                '단가': str(row[7]).replace(',', '') if pd.notna(row[7]) else '',
-                '주문금액': str(row[8]).replace(',', '') if pd.notna(row[8]) else '',
-                '입고허용일': str(row[9]).replace('.0', '') if pd.notna(row[9]) else '',
-            }
-            items.append(item)
-        
-        i += 1
-    
-    # 마지막 센터 처리
-    if current_center and items:
-        centers.append({'센터': current_center, '발주코드': doc_info.get(current_center, ''), '문서번호': doc_info.get(current_center + '_doc', ''), 'items': items})
-    
-    return centers
+if not os.path.exists(TEMPLATE_FILE):
+    st.error(f"⚠️ '{TEMPLATE_FILE}' 파일을 찾을 수 없습니다. 깃허브에 파일이 있는지 확인해주세요.")
+    st.stop()
 
+uploaded_file = st.file_uploader("📥 EDI Raw Data 업로드", type=['xlsx', 'csv'])
 
-def get_template_info(template_bytes):
-    """서식파일에서 센터-배송코드 매핑 및 상품코드-발주코드 매핑 추출"""
-    wb = load_workbook(io.BytesIO(template_bytes), data_only=True)
-    
-    # RAW 시트에서 센터-발주코드 매핑
-    raw_sheet = wb['롯데마트 RAW']
-    center_to_order_code = {}
-    for row in raw_sheet.iter_rows(min_row=2, values_only=True):
-        if row[0] and row[1]:  # 점포코드, 센터명
-            center_to_order_code[str(row[1])] = str(row[0])
-    
-    # 수주 시트에서 상품코드-발주코드-배송코드 매핑
-    order_sheet = wb['롯데마트 수주']
-    product_info = {}  # 상품코드 -> {발주코드, 배송코드, 센터, 품명, 단가}
-    for row in order_sheet.iter_rows(min_row=2, values_only=True):
-        if row[5] and row[6]:  # 상품코드, 품명
-            product_info[str(row[5])] = {
-                '발주코드': str(row[1]) if row[1] else '',
-                '배송코드': str(row[3]) if row[3] else '',
-                '센터': str(row[4]) if row[4] else '',
-                '품명': str(row[6]) if row[6] else '',
-                '단가': row[8] if row[8] else 0,
-            }
-    
-    return center_to_order_code, product_info
-
-
-def build_output(template_bytes, order_centers, center_to_order_code, product_info):
-    """서식파일 기반으로 출력 엑셀 생성"""
-    wb = load_workbook(io.BytesIO(template_bytes))
-    
-    # ─── 시트 1: 롯데마트 RAW ───────────────────────────────
-    raw_sheet = wb['롯데마트 RAW']
-    
-    # 기존 데이터 삭제 (헤더 유지)
-    for row in raw_sheet.iter_rows(min_row=2):
-        for cell in row:
-            cell.value = None
-    
-    current_row = 2
-    for center_data in order_centers:
-        센터명 = center_data['센터']
-        발주코드 = center_to_order_code.get(센터명, '')
-        
-        items = center_data['items']
-        if not items:
-            continue
-        
-        # 점포명을 제외하고 상품코드~입고허용일 기입
-        for item in items:
-            raw_sheet.cell(row=current_row, column=1).value = 발주코드  # 점포코드
-            raw_sheet.cell(row=current_row, column=2).value = 센터명    # 점포(센터)
-            raw_sheet.cell(row=current_row, column=3).value = item['상품코드']
-            raw_sheet.cell(row=current_row, column=4).value = item['판매코드']
-            raw_sheet.cell(row=current_row, column=5).value = item['상품명']
-            raw_sheet.cell(row=current_row, column=6).value = item['점포명']  # 점포명
-            raw_sheet.cell(row=current_row, column=7).value = item['규격']
-            raw_sheet.cell(row=current_row, column=8).value = item['입수']
-            raw_sheet.cell(row=current_row, column=9).value = item['주문수']  # (BOX) 제거된 값
-            raw_sheet.cell(row=current_row, column=10).value = item['단가']
-            raw_sheet.cell(row=current_row, column=11).value = item['주문금액']
-            raw_sheet.cell(row=current_row, column=12).value = item['입고허용일']
-            current_row += 1
-    
-    # ─── 시트 2: 롯데마트 수주 ──────────────────────────────
-    order_sheet = wb['롯데마트 수주']
-    
-    # 기존 데이터 삭제 (헤더 유지)
-    for row in order_sheet.iter_rows(min_row=2):
-        for cell in row:
-            cell.value = None
-    
-    # 주문 데이터 집계: 센터 + 상품코드 기준으로 수량 합산
-    from collections import defaultdict
-    agg = defaultdict(lambda: {'수량': 0, '단가': 0, '품명': '', '발주코드': '', '배송코드': '', '센터': ''})
-    
-    for center_data in order_centers:
-        센터명 = center_data['센터']
-        발주코드 = center_to_order_code.get(센터명, '')
-        
-        for item in center_data['items']:
-            # 상품코드로 배송코드 찾기
-            prod_code = item['상품코드']
-            prod_meta = None
-            for code, meta in product_info.items():
-                if prod_code in code or code in prod_code:
-                    prod_meta = meta
-                    break
-            
-            배송코드 = prod_meta['배송코드'] if prod_meta else ''
-            품명 = prod_meta['품명'] if prod_meta else item['상품명']
-            단가 = int(str(item['단가']).replace(',', '')) if item['단가'] else 0
-            
-            key = (발주코드, 배송코드, 센터명)
-            agg[key]['수량'] += item['주문수']
-            agg[key]['단가'] = 단가
-            agg[key]['품명'] = 품명
-            agg[key]['발주코드'] = 발주코드
-            agg[key]['배송코드'] = 배송코드
-            agg[key]['센터'] = 센터명
-    
-    # 수량 > 0인 항목만 기입
-    current_row = 2
-    for key, data in agg.items():
-        if data['수량'] > 0:
-            total = data['수량'] * data['단가']
-            order_sheet.cell(row=current_row, column=2).value = data['발주코드']
-            order_sheet.cell(row=current_row, column=4).value = data['배송코드']
-            order_sheet.cell(row=current_row, column=5).value = data['센터']
-            order_sheet.cell(row=current_row, column=6).value = key[1]  # 배송코드(상품코드)
-            order_sheet.cell(row=current_row, column=7).value = data['품명']
-            order_sheet.cell(row=current_row, column=8).value = data['수량']
-            order_sheet.cell(row=current_row, column=9).value = data['단가']
-            order_sheet.cell(row=current_row, column=10).value = total
-            current_row += 1
-    
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-    return output
-
-
-# ─── 메인 로직 ──────────────────────────────────────────────
-if template_file and order_file:
-    template_bytes = template_file.read()
-    order_bytes = order_file.read()
-    
-    with st.spinner("파일 분석 중..."):
+if uploaded_file is not None:
+    with st.spinner("데이터 매칭 및 유효 건 추출 중..."):
         try:
-            order_centers = parse_order_file(order_bytes)
-            center_to_order_code, product_info = get_template_info(template_bytes)
-        except Exception as e:
-            st.error(f"파일 파싱 오류: {e}")
-            st.stop()
-    
-    # 미리보기
-    st.markdown("---")
-    st.subheader("📊 파싱 결과 미리보기")
-    
-    for center_data in order_centers:
-        with st.expander(f"🏭 {center_data['센터']} ({len(center_data['items'])}개 항목)"):
-            df_preview = pd.DataFrame(center_data['items'])
-            st.dataframe(df_preview, use_container_width=True)
-    
-    # 수주 요약 미리보기
-    st.subheader("📋 수주 요약 (수량 > 0)")
-    from collections import defaultdict
-    agg = defaultdict(lambda: {'수량': 0, '단가': 0, '품명': '', '발주코드': '', '배송코드': '', '센터': ''})
-    
-    for center_data in order_centers:
-        센터명 = center_data['센터']
-        발주코드 = center_to_order_code.get(센터명, '')
-        for item in center_data['items']:
-            prod_code = item['상품코드']
-            prod_meta = None
-            for code, meta in product_info.items():
-                if prod_code in code or code in prod_code:
-                    prod_meta = meta
-                    break
-            배송코드 = prod_meta['배송코드'] if prod_meta else ''
-            품명 = prod_meta['품명'] if prod_meta else item['상품명']
-            단가 = int(str(item['단가']).replace(',', '')) if item['단가'] else 0
-            key = (발주코드, 배송코드, 센터명)
-            agg[key]['수량'] += item['주문수']
-            agg[key]['단가'] = 단가
-            agg[key]['품명'] = 품명
-            agg[key]['발주코드'] = 발주코드
-            agg[key]['배송코드'] = 배송코드
-            agg[key]['센터'] = 센터명
-    
-    summary_rows = []
-    for key, data in agg.items():
-        if data['수량'] > 0:
-            summary_rows.append({
-                '발주코드': data['발주코드'],
-                '배송코드': data['배송코드'],
-                '센터': data['센터'],
-                '상품코드': key[1],
-                '품명': data['품명'],
-                'Unit수량': data['수량'],
-                '단가': data['단가'],
-                'Total Amount': data['수량'] * data['단가'],
-            })
-    
-    if summary_rows:
-        df_summary = pd.DataFrame(summary_rows)
-        st.dataframe(df_summary, use_container_width=True)
-    else:
-        st.info("수량 > 0인 항목이 없습니다.")
-    
-    # 출력 파일 생성
-    st.markdown("---")
-    if st.button("📥 엑셀 파일 생성 및 다운로드", type="primary"):
-        with st.spinner("엑셀 생성 중..."):
-            try:
-                output = build_output(template_bytes, order_centers, center_to_order_code, product_info)
-                st.download_button(
-                    label="💾 완성된 엑셀 다운로드",
-                    data=output,
-                    file_name="롯데마트_발주서_완성.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-                st.success("✅ 엑셀 파일 생성 완료!")
-            except Exception as e:
-                st.error(f"엑셀 생성 오류: {e}")
+            # 1. 업로드된 EDI Raw 데이터 파싱 (안전한 텍스트 기반 추출)
+            if uploaded_file.name.endswith('.csv'):
+                df_edi = pd.read_csv(uploaded_file, header=None)
+            else:
+                df_edi = pd.read_excel(uploaded_file, header=None)
+            
+            parsed_list = []
+            curr_center = ""
+            curr_doc = ""
+            
+            for i, row in df_edi.iterrows():
+                r = [str(x).strip() for x in row.tolist()]
+                
+                # 'ORDERS' 행에서 문서번호와 센터명 추출
+                if r[0] == 'ORDERS':
+                    curr_doc = r[1].replace('.0', '')
+                    curr_center = r[5]
+                    continue
+                
+                # 상품 행 (880 바코드 기준)
+                val_code = r[1].replace('.0', '')
+                if val_code.startswith('880'):
+                    # 입수 (콤마 제거 후 숫자 변환)
+                    ipsu_str = r[5].replace(',', '')
+                    ipsu = int(float(ipsu_str)) if ipsu_str.replace('.', '').isdigit() else 1
+                    
+                    # 주문수 (글자 제거 후 숫자만 추출)
+                    qty_str = r[6]
+                    qty_nums = re.sub(r'[^0-9]', '', qty_str)
+                    qty = int(qty_nums) if qty_nums else 0
+                    
+                    unit_qty = ipsu * qty
+                    
+                    if unit_qty > 0:
+                        parsed_list.append({
+                            '발주코드': curr_doc,
+                            '센터': curr_center,
+                            '판매코드': val_code,
+                            'UNIT수량': unit_qty
+                        })
+            
+            df_parsed = pd.DataFrame(parsed_list)
+            
+            if df_parsed.empty:
+                st.warning("⚠️ 추출할 유효 수량(0 초과)이 없습니다.")
+                st.stop()
 
-else:
-    st.info("👆 위에서 두 파일을 모두 업로드해주세요.")
-    st.markdown("""
-    **파일 설명:**
-    - **서식파일**: 롯데마트 RAW, 수주 시트가 포함된 템플릿
-    - **주문파일**: 센터별 주문 데이터 (예: `라떼는.xlsx`)
-    """)
+            # 2. 템플릿 1번 시트(RAW)에서 바코드 -> ME코드 매핑 정보 가져오기
+            df_raw_template = pd.read_excel(TEMPLATE_FILE, sheet_name=0)
+            
+            # 컬럼 이름이 유동적일 수 있으므로 '판매코드', '상품코드' 키워드로 열 찾기
+            panmae_cols = [c for c in df_raw_template.columns if '판매코드' in str(c)]
+            sangpum_cols = [c for c in df_raw_template.columns if '상품코드' in str(c)]
+            
+            panmae_col = panmae_cols[0] if panmae_cols else df_raw_template.columns[3]
+            me_col = sangpum_cols[-1] if sangpum_cols else df_raw_template.columns[-1]
+            
+            df_mapping = df_raw_template[[panmae_col, me_col]].dropna()
+            df_mapping.columns = ['판매코드', 'ME코드']
+            df_mapping['판매코드'] = df_mapping['판매코드'].astype(str).str.replace('.0', '', regex=False).str.strip()
+            df_mapping['ME코드'] = df_mapping['ME코드'].astype(str).str.strip()
+            df_mapping = df_mapping.drop_duplicates()
+
+            # EDI 데이터에 ME코드 붙이기
+            df_mapped = pd.merge(df_parsed, df_mapping, on='판매코드', how='left')
+            # 맵핑 실패 시 원본 바코드 유지
+            df_mapped['ME코드'] = df_mapped['ME코드'].fillna(df_mapped['판매코드'])
+            
+            # 센터와 ME코드 기준으로 수량 합산 (중복 방지)
+            df_agg = df_mapped.groupby(['센터', 'ME코드', '발주코드'], as_index=False)['UNIT수량'].sum()
+
+            # 3. 템플릿 2번 시트(수주)와 매칭하여 최종 결과 만들기
+            df_order = pd.read_excel(TEMPLATE_FILE, sheet_name=1)
+            orig_cols = list(df_order.columns) # 원본 양식(빈 열 포함) 기억하기
+            
+            # 매칭을 위해 공백 제거
+            df_order['센터_str'] = df_order['센터'].astype(str).str.strip()
+            df_order['상품코드_str'] = df_order['상품코드'].astype(str).str.strip()
+            
+            df_agg['센터_str'] = df_agg['센터'].astype(str).str.strip()
+            df_agg['ME코드_str'] = df_agg['ME코드'].astype(str).str.strip()
+            
+            # 유효 수량이 있는 데이터만 2번 시트 양식과 이너 조인(교집합)
+            final_df = pd.merge(df_order, df_agg, left_on=['센터_str', '상품코드_str'], right_on=['센터_str', 'ME코드_str'], how='inner')
+            
+            # 4. 값 갱신 및 Total Amount 계산
+            final_df['발주코드'] = final_df['발주코드_y'] # EDI에서 뽑은 문서번호로 덮어쓰기
+            final_df['배송코드'] = final_df['발주코드_y']
+            final_df['UNIT수량'] = final_df['UNIT수량_y']
+            
+            # 단가 계산 (콤마 등 불순물 제거)
+            def clean_price(x):
+                try:
+                    return float(str(x).replace(',', ''))
+                except:
+                    return 0.0
+            
+            final_df['UNIT단가_clean'] = final_df['UNIT단가'].apply(clean_price)
+            final_df['Total Amount'] = final_df['UNIT수량'] * final_df['UNIT단가_clean']
+            
+            # 5. 원래 2번 시트 양식(컬럼)으로 되돌리기
+            out_df = final_df[orig_cols].copy()
+            
+            # Unnamed(빈 열) 이름을 다시 공백으로 변환하여 엑셀 양식 완벽 유지
+            clean_cols = []
+            space_cnt = 1
+            for c in out_df.columns:
+                if 'Unnamed' in str(c):
+                    clean_cols.append(" " * space_cnt)
+                    space_cnt += 1
+                else:
+                    clean_cols.append(c)
+            out_df.columns = clean_cols
+
+            st.success(f"변환 완료! 유효 수주 {len(out_df)}건이 추출되었습니다.")
+            st.dataframe(out_df, use_container_width=True)
+
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                out_df.to_excel(writer, index=False, sheet_name='롯데마트 수주')
+            
+            st.download_button(
+                label="📥 최종 수주 파일 다운로드",
+                data=buffer.getvalue(),
+                file_name=f"롯데마트_수주_완료_{curr_doc}.xlsx",
+                mime="application/vnd.ms-excel"
+            )
+
+        except Exception as e:
+            st.error(f"오류가 발생했습니다: {e}")
+            st.info("데이터 파싱 중 문제가 발생했습니다. 관리자에게 에러 메시지를 알려주세요.")
