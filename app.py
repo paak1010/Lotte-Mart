@@ -2,61 +2,113 @@ import streamlit as st
 import pandas as pd
 import duckdb
 import io
+import re
 
-st.set_page_config(page_title="롯데마트 수주 자동화", layout="wide")
+st.set_page_config(page_title="롯데마트 수주 자동화 V2", layout="wide")
 
-st.title("📦 롯데마트 발주서 자동 변환기")
-st.write("EDI에서 다운로드한 RAW 데이터를 업로드하면 유효 발주 건(주문수 > 0)만 추출합니다.")
+st.title("📦 롯데마트 수주서 변환기 (최종 양식 맞춤)")
+st.write("EDI RAW 데이터를 업로드하면 '롯데마트 수주' 시트 양식으로 즉시 변환합니다.")
 
-uploaded_file = st.file_uploader("롯데마트 RAW 데이터 (예: 라떼는.xlsx) 업로드", type=['xlsx', 'csv'])
+# 1. 매핑 데이터 로드 (GitHub에 올린 mapping.csv 활용)
+@st.cache_data
+def load_mapping():
+    try:
+        df = pd.read_csv('mapping.csv')
+        # 바코드를 문자열로 통일
+        df['바코드'] = df['바코드'].astype(str)
+        return df
+    except:
+        st.warning("⚠️ 'mapping.csv' 파일을 찾을 수 없습니다. 상품코드 매핑 없이 진행합니다.")
+        return pd.DataFrame(columns=['바코드', 'ME코드'])
+
+mapping_df = load_mapping()
+
+# 2. 파일 업로드
+uploaded_file = st.file_uploader("EDI 발주서 (라떼는.xlsx 등) 업로드", type=['xlsx', 'csv'])
 
 if uploaded_file is not None:
-    with st.spinner("DuckDB가 데이터를 처리 중입니다..."):
+    with st.spinner("데이터 매핑 및 변환 중..."):
         try:
-            # 1. 헤더 없이 데이터 전체 읽기 (양식이 복잡하므로)
+            # 데이터 로드
             if uploaded_file.name.endswith('.csv'):
-                df_raw = pd.read_csv(uploaded_file, header=None)
+                df_all = pd.read_csv(uploaded_file, header=None)
             else:
-                df_raw = pd.read_excel(uploaded_file, header=None, sheet_name=0)
+                df_all = pd.read_excel(uploaded_file, header=None)
+
+            # --- EDI 데이터 파싱 로직 ---
+            final_rows = []
+            current_center = ""
+            current_doc_no = ""
             
-            # 2. 가장 넓은 행을 기준으로 10개 컬럼 이름 강제 지정
-            # B2B 양식의 실제 데이터 행 구조: 
-            # 상품코드, 판매코드, 상품명, 점포명, 규격, 입수, 주문수, 단가, 주문금액, 입고허용일
-            df_raw = df_raw.iloc[:, :10] # 혹시 모를 추가 빈 컬럼 방지
-            df_raw.columns = ['상품코드', '판매코드', '상품명', '점포명', '규격', '입수', '주문수', '단가', '주문금액', '입고허용일']
-            
-            # 3. Pandas로 1차 클렌징: '판매코드'가 880으로 시작하는 진짜 상품 행만 살리기
-            df_clean = df_raw[df_raw['판매코드'].astype(str).str.startswith('880')].copy()
-            
-            # 4. '1 (BOX)' 처럼 문자가 섞인 주문수에서 숫자만 추출
-            df_clean['주문수_숫자'] = df_clean['주문수'].astype(str).str.replace(r'[^0-9]', '', regex=True)
-            df_clean['주문수_숫자'] = pd.to_numeric(df_clean['주문수_숫자'], errors='coerce').fillna(0).astype(int)
-            
-            # 5. DuckDB를 활용한 고속 필터링 (주문수가 0보다 큰 것만)
+            for i, row in df_all.iterrows():
+                row_list = row.tolist()
+                
+                # 'ORDERS'로 시작하는 행에서 센터명과 문서번호 추출
+                if str(row_list[0]) == 'ORDERS':
+                    current_doc_no = str(row_list[1])
+                    current_center = str(row_list[5]) # 점포(센터)
+                    continue
+                
+                # 실제 상품 행 추출 (판매코드가 880으로 시작)
+                val_code = str(row_list[1])
+                if val_code.startswith('880'):
+                    # 주문수에서 숫자만 추출 (예: '1 (BOX)' -> 1)
+                    order_qty_raw = str(row_list[6])
+                    order_qty_val = int(re.sub(r'[^0-9]', '', order_qty_raw))
+                    
+                    # 입수량 추출 및 총 수량 계산 (UNIT수량)
+                    case_size = int(row_list[5]) if pd.notnull(row_list[5]) else 1
+                    total_units = order_qty_val * case_size
+                    
+                    if total_units > 0:
+                        final_rows.append({
+                            '발주코드': current_doc_no, # 또는 센터코드 매핑 필요 시 수정
+                            '배송코드': current_doc_no,
+                            '센터': current_center,
+                            '바코드': val_code,
+                            '품명': row_list[2],
+                            'UNIT수량': total_units,
+                            'UNIT단가': row_list[7],
+                            'Total Amount': row_list[8]
+                        })
+
+            df_extracted = pd.DataFrame(final_rows)
+
+            # 3. DuckDB를 활용한 ME 코드 매핑 및 최종 양식 구성
             query = """
-                SELECT * EXCLUDE (주문수_숫자)
-                FROM df_clean
-                WHERE 주문수_숫자 > 0
+                SELECT 
+                    '' as " ", 
+                    a.발주코드, 
+                    '' as "  ", 
+                    a.배송코드, 
+                    a.센터, 
+                    COALESCE(m.ME코드, a.바코드) as 상품코드, 
+                    a.품명, 
+                    a.UNIT수량, 
+                    a.UNIT단가, 
+                    a."Total Amount",
+                    '' as "   "
+                FROM df_extracted a
+                LEFT JOIN mapping_df m ON a.바코드 = m.바코드
             """
             
             result_df = duckdb.query(query).df()
-            
-            st.success(f"데이터 정제 완료! 총 {len(result_df)}건의 유효 발주가 추출되었습니다.")
-            
-            st.subheader("✅ 정제된 수주 리스트 (미리보기)")
+
+            st.success(f"처리 완료! {len(result_df)}개의 품목이 생성되었습니다.")
+            st.subheader("📋 수주 시트 미리보기")
             st.dataframe(result_df, use_container_width=True)
-            
-            # 6. 엑셀 다운로드 (두 번째 시트 '수주' 포맷으로 저장)
+
+            # 4. 엑셀 다운로드 (양식 유지)
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                 result_df.to_excel(writer, index=False, sheet_name='롯데마트 수주')
             
             st.download_button(
-                label="📥 최종 수주 엑셀 파일 다운로드",
+                label="📥 롯데마트 수주 양식 다운로드",
                 data=buffer.getvalue(),
-                file_name="롯데마트_수주_변환완료.xlsx",
+                file_name=f"롯데마트_수주_{current_doc_no}.xlsx",
                 mime="application/vnd.ms-excel"
             )
-            
+
         except Exception as e:
-            st.error(f"데이터 처리 중 오류가 발생했습니다: {e}")
+            st.error(f"오류 발생: {e}")
