@@ -39,7 +39,7 @@ def clean_number(val):
     s = re.sub(r'[^0-9]', '', s)
     return int(s) if s else 0
 
-uploaded_file = st.file_uploader("📥 EDI Raw Data (라떼는.xlsx 등) 업로드", type=['xlsx', 'csv'])
+uploaded_file = st.file_uploader("📥 EDI Raw Data (xls 변환) 업로드", type=['xlsx', 'csv'])
 
 if uploaded_file is not None:
     with st.spinner("마스터 단가 매핑 및 숫자 포맷 변환 중입니다... 🚀"):
